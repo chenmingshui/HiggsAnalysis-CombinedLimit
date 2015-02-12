@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
 #include <string>
 #include <memory>
 #include <typeinfo>
@@ -30,6 +31,8 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
+
+#include "../interface/CloseCoutSentry.h"
 
 using namespace std;
 
@@ -412,9 +415,11 @@ void utils::copyAttributes(const RooAbsArg &from, RooAbsArg &to) {
     if (!attribs.empty()) {
         for (std::set<std::string>::const_iterator it = attribs.begin(), ed = attribs.end(); it != ed; ++it) to.setAttribute(it->c_str());
     }
-    const std::map<std::string, std::string> strattribs = from.stringAttributes();
+    const std::map
+<std::string, std::string> strattribs = from.stringAttributes();
     if (!strattribs.empty()) {
-        for (std::map<std::string,std::string>::const_iterator it = strattribs.begin(), ed = strattribs.end(); it != ed; ++it) to.setStringAttribute(it->first.c_str(), it->second.c_str());
+        for (std::map
+        <std::string,std::string>::const_iterator it = strattribs.begin(), ed = strattribs.end(); it != ed; ++it) to.setStringAttribute(it->first.c_str(), it->second.c_str());
     }
 }
 
@@ -690,4 +695,57 @@ std::vector<std::vector<int> > utils::generateCombinations(const std::vector<int
     }
 
   return result;
+}
+
+
+bool utils::isParameterAtBoundary( const RooRealVar &param ){
+
+    double vMin = param.getMin();
+    double vMax = param.getMax();
+    double val = param.getVal();
+    double errLo = -1.0 * param.getErrorLo(); 
+    double errHi = param.getErrorHi(); 
+
+    double pullMin = (val-vMin) / (errLo);
+    double pullMax = (vMax-val) / (errHi);
+
+    float nSigma=1.0;
+
+    if(pullMin < nSigma || pullMax < nSigma){
+        return true;
+    }
+    
+    return false;
+}
+
+
+bool utils::anyParameterAtBoundaries( const RooArgSet &params, int verbosity ){
+
+    static std::unordered_map<std::string, unsigned char> timesFoundAtBoundary;
+    bool isAnyBad = false;
+
+    RooLinkedListIter iter = params.iterator(); int i = 0;
+    for (RooRealVar *a = (RooRealVar *) iter.Next(); a != 0; a = (RooRealVar *) iter.Next(), ++i) {
+
+        bool isBad = isParameterAtBoundary(*a);
+
+        if(isBad){
+            std::string varName((*a).GetName());
+
+            if( verbosity >= 9 || (timesFoundAtBoundary[varName] < 3 && verbosity > -1) ){
+                fprintf(CloseCoutSentry::trueStdOutGlobal(),"  [WARNING] Found [%s] at boundary. \n", (*a).GetName());
+                std::cout << "       "; (*a).Print();
+            }
+
+            timesFoundAtBoundary[varName]++;
+        }
+
+        isAnyBad |= isBad;
+    }
+
+    // for( std::unordered_map<std::string, unsigned char>::value_type e : timesFoundAtBoundary ){
+    //     printf("e %s -> %i\n", e.first.c_str(), e.second);
+    // }
+    
+    return isAnyBad;
 }
