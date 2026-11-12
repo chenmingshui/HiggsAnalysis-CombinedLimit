@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <algorithm>
@@ -62,6 +63,8 @@
 #include "../interface/RooMultiPdfCombine.h"
 #include "../interface/CMSHistFunc.h"
 #include "../interface/CMSHistSum.h"
+#include "../interface/GpuManager.h"
+#include "../interface/GpuNllEngine.h"
 
 #include "../interface/CombineLogger.h"
 
@@ -168,6 +171,10 @@ Combine::Combine() :
       ("text2workspace",   boost::program_options::value<std::string>(&textToWorkspaceString_)->default_value(""), "Pass along options to text2workspace (default = none)")
       ("trackParameters",   boost::program_options::value<std::string>(&trackParametersNameString_)->default_value(""), "Keep track of parameters in workspace, also accepts regexp with syntax 'rgx{<my regexp>}' (default = none)")
       ("trackErrors",   boost::program_options::value<std::string>(&trackErrorsNameString_)->default_value(""), "Keep track of errors on parameters in workspace, also accepts regexp with syntax 'rgx{<my regexp>}' (default = none)")
+      ("gpu", po::bool_switch(&gpuEnabled_), "Enable GPU acceleration of the NLL evaluation (implies --nllbackend cuda, requires a CUDA enabled ROOT build)")
+      ("gpuDevice", po::value<int>(&gpuDevice_)->default_value(0), "CUDA device index to use when GPU acceleration is enabled")
+      ("gpuDevices", po::value<std::string>(&gpuDevices_)->default_value(""), "Comma separated list of CUDA device indices for multi-GPU work (empty: use gpuDevice only)")
+      ("nllbackend", po::value<std::string>(&Combine::nllBackend())->default_value(Combine::nllBackend()), "Set the backend used to create the NLL. Choices: combine (default, fastest for CMS analyses), cpu, legacy, codegen, cuda (requires a CUDA enabled ROOT build and --gpu)")
       ; 
 }
 
@@ -221,6 +228,50 @@ void Combine::applyOptions(const boost::program_options::variables_map &vm) {
   }
 
   makeToyGenSnapshot_ = (method == "FitDiagnostics" && !vm.count("justFit"));
+
+  // Validate the requested NLL backend.
+  {
+    std::set<std::string> allowedNllBackends{"combine", "legacy", "cpu", "codegen", "cuda"};
+    if (allowedNllBackends.find(nllBackend()) == allowedNllBackends.end())
+      throw std::invalid_argument(
+          "option 'nllbackend' can only take as values 'combine', 'legacy', "
+          "'cpu', 'codegen' and 'cuda'\n");
+  }
+
+  // GPU configuration. --gpu is a shortcut for "--nllbackend cuda" plus
+  // device selection. This is done here, in the common options, so that every
+  // statistical method can use the GPU.
+  if (gpuEnabled_) {
+    GpuManager::instance().setEnabled(true);
+    if (!GpuManager::instance().available()) {
+      std::cerr << "WARNING: --gpu requested but no CUDA device is available. "
+                   "GPU acceleration will be disabled." << std::endl;
+      GpuManager::instance().setEnabled(false);
+      if (nllBackend() == "cuda") {
+        std::cerr << "WARNING: falling back to the 'cpu' NLL backend." << std::endl;
+        Combine::nllBackend() = "cpu";
+      }
+    } else {
+      if (!gpuDevices_.empty()) {
+        std::vector<int> devs;
+        std::stringstream ss(gpuDevices_);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+          if (token.empty()) continue;
+          devs.push_back(std::stoi(token));
+        }
+        GpuManager::instance().setDevices(devs);
+      }
+      GpuManager::instance().setDevice(gpuDevice_);
+      if (nllBackend() != "cuda") Combine::nllBackend() = "cuda";
+      if (verbose) {
+        std::cerr << "GPU acceleration enabled: using CUDA device " << gpuDevice_
+                  << " (" << GpuManager::instance().deviceName(gpuDevice_) << ")" << std::endl;
+      }
+    }
+  } else {
+    GpuManager::instance().setEnabled(false);
+  }
 }
 
 namespace {
@@ -1306,6 +1357,20 @@ std::unique_ptr<RooAbsReal> combineCreateNLL(
   bool isSimultaneousOpt = dynamic_cast<RooSimultaneousOpt const *>(&pdf);
   std::string evalBackend = Combine::nllBackend();
 
+  // The CUDA backend needs both a CUDA-capable device and a ROOT build that
+  // was compiled with CUDA support. If either is missing we fall back to the
+  // CPU backend instead of failing hard, so that analyses keep running.
+  if (evalBackend == "cuda") {
+    GpuNllEngine gpuEngine;
+    if (!gpuEngine.available() || !gpuEngine.rootCudaBackendAvailable()) {
+      std::cerr << "WARNING: the 'cuda' NLL backend was requested but is not available "
+                   "(CUDA device or ROOT CUDA backend missing). Falling back to 'cpu'."
+                << std::endl;
+      evalBackend = "cpu";
+      Combine::nllBackend() = "cpu";
+    }
+  }
+
   // Alternative evaluation backends are only supported from ROOT 6.30.
 #if ROOT_VERSION_CODE < ROOT_VERSION(6, 30, 0)
   return std::unique_ptr<RooAbsReal>{pdf.createNLL(data, cmdList)};
@@ -1333,8 +1398,21 @@ std::unique_ptr<RooAbsReal> combineCreateNLL(
               << std::endl;
   }
 
-  RooCmdArg evalBackendCmdArg = RooFit::EvalBackend(evalBackend);
-  cmdList.Add(&evalBackendCmdArg);
+  // Create the NLL with a given evaluation backend, keeping the constraint and
+  // offset settings.
+  auto createWithBackend = [&](std::string const &backend) -> std::unique_ptr<RooAbsReal> {
+    RooLinkedList localCmdList;
+    RooCmdArg localConstrain = constrain ? RooFit::Constrain(*constrain) : RooCmdArg();
+    localCmdList.Add(&localConstrain);
+    RooCmdArg localOffset = RooFit::Offset(offset);
+    localCmdList.Add(&localOffset);
+    RooCmdArg localBackend = RooFit::EvalBackend(backend);
+    localCmdList.Add(&localBackend);
+    if (isSimultaneousOpt) {
+      return static_cast<RooSimultaneousOpt &>(pdf).createNLLPassthrough(data, localCmdList);
+    }
+    return std::unique_ptr<RooAbsReal>{pdf.createNLL(data, localCmdList)};
+  };
 
   // If we use "codegen", we need to declare the math functions to the
   // interpreter.
@@ -1344,12 +1422,25 @@ std::unique_ptr<RooAbsReal> combineCreateNLL(
     declaredMathFuncs = true;
   }
 
-  // If we don't use the "combine" backend, use the base class implementation
-  // (and not the one of the RooSimultaneousOpt).
-  if (isSimultaneousOpt) {
-    return static_cast<RooSimultaneousOpt &>(pdf).createNLLPassthrough(data, cmdList);
-  } else {
-    return std::unique_ptr<RooAbsReal>{pdf.createNLL(data, cmdList)};
+  try {
+    auto nll = createWithBackend(evalBackend);
+    if (evalBackend == "cuda") {
+      // ROOT creates the CUDA evaluator lazily on the first evaluation and
+      // throws if the CUDA backend cannot be loaded. Force it here so that we
+      // can fall back to the CPU instead of failing in the middle of a fit.
+      nll->getVal();
+    }
+    return nll;
+  } catch (std::exception const &e) {
+    // CUDA may be requested on a machine (or ROOT build) where it is not
+    // actually usable. Fall back to the CPU backend instead of aborting.
+    if (evalBackend == "cuda") {
+      std::cerr << "WARNING: CUDA NLL creation failed (" << e.what()
+                << "). Falling back to the 'cpu' backend." << std::endl;
+      Combine::nllBackend() = "cpu";
+      return createWithBackend("cpu");
+    }
+    throw;
   }
 #endif
 }

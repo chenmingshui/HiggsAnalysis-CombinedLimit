@@ -119,6 +119,11 @@ private:
   bool freezeAllGlobalObs_;
   std::vector<std::string> librariesToLoad_;
   std::vector<std::string> modelPoints_;
+
+  // GPU acceleration (see docs/part3/gpu.md)
+  bool gpuEnabled_;
+  int gpuDevice_;
+  std::string gpuDevices_;
   
   static TTree *tree_;
 

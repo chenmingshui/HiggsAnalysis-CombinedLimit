@@ -5,6 +5,7 @@ project(HiggsAnalysisCombinedLimit VERSION 10.2.1)
 option( MODIFY_ROOTMAP "Modify generated Rootmap to take out classes already bundled in StatAnalysis" FALSE )
 option( USE_VDT "Use VDT (fast and vectorisable mathematical functions)" TRUE )
 option( BUILD_TESTS "Build unit test executables for additional testing" FALSE )
+option( USE_CUDA "Enable GPU acceleration with CUDA (requires a CUDA toolkit and a CUDA-enabled ROOT build)" FALSE )
 
 
 # Use the same mechanism as ROOT for the install directories of components (see RootInstallDirs.cmake)
@@ -70,6 +71,29 @@ endif()
 
 file(GLOB HEADERS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} interface/*.h*)
 file(GLOB SOURCES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} src/*.c*)
+# The CUDA kernel file is only compiled when CUDA support is requested, so it
+# is removed from the default source list and added back conditionally below.
+list(FILTER SOURCES EXCLUDE REGEX "\\.cu$")
+
+if(USE_CUDA)
+  enable_language(CUDA)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.17)
+    find_package(CUDAToolkit REQUIRED)
+    set(COMBINE_CUDA_LIB CUDA::cudart)
+  else()
+    find_package(CUDA REQUIRED)
+    set(COMBINE_CUDA_LIB ${CUDA_CUDART_LIBRARY})
+    include_directories(${CUDA_INCLUDE_DIRS})
+  endif()
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 70 80)
+  endif()
+  list(APPEND SOURCES src/gpu_kernels.cu)
+  set_source_files_properties(src/gpu_kernels.cu PROPERTIES LANGUAGE CUDA)
+  message(STATUS "CUDA support enabled: device code in src/gpu_kernels.cu")
+else()
+  message(STATUS "CUDA support disabled (reconfigure with -DUSE_CUDA=TRUE to enable)")
+endif()
 
 # includes require "HiggsAnalysis/CombinedLimit" prefix in many places
 # so create a symlink in the build dir
@@ -85,6 +109,48 @@ ROOT_GENERATE_DICTIONARY(G__${LIBNAME} HiggsAnalysis/CombinedLimit/src/classes.h
 add_library(${LIBNAME} SHARED ${SOURCES} G__${LIBNAME}.cxx)
 set_target_properties(${LIBNAME} PROPERTIES PUBLIC_HEADER "${HEADERS}")
 target_link_libraries (${LIBNAME} Eigen3::Eigen ${ROOT_LIBRARIES} ${Boost_LIBRARIES})
+
+if(USE_CUDA)
+  target_compile_definitions(${LIBNAME} PUBLIC HAS_CUDA)
+  target_link_libraries(${LIBNAME} ${COMBINE_CUDA_LIB})
+  # The conda toolchain does not search /usr/include by default, and CMake
+  # filters implicit system include directories out of target_include_directories().
+  # Pass the CUDA runtime header directory explicitly instead.
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.17)
+    set(_combine_cuda_include_hints ${CUDAToolkit_INCLUDE_DIRS})
+  else()
+    set(_combine_cuda_include_hints ${CUDA_INCLUDE_DIRS})
+  endif()
+  find_path(COMBINE_CUDA_RUNTIME_INCLUDE_DIR cuda_runtime.h
+            HINTS ${_combine_cuda_include_hints}
+            PATHS /usr/include /usr/local/cuda/include)
+  if(COMBINE_CUDA_RUNTIME_INCLUDE_DIR)
+    target_include_directories(${LIBNAME} PUBLIC ${COMBINE_CUDA_RUNTIME_INCLUDE_DIR})
+    # -idirafter keeps the conda sysroot headers ahead of the system glibc
+    # headers in /usr/include, while still letting the CUDA headers be found.
+    # It must only be applied to C++ files: nvcc does not understand it.
+    target_compile_options(${LIBNAME} PUBLIC
+      "$<$<COMPILE_LANGUAGE:CXX>:-idirafter>"
+      "$<$<COMPILE_LANGUAGE:CXX>:${COMBINE_CUDA_RUNTIME_INCLUDE_DIR}>")
+    message(STATUS "CUDA runtime headers: ${COMBINE_CUDA_RUNTIME_INCLUDE_DIR}")
+  endif()
+  # The conda linker does not search /usr/lib/x86_64-linux-gnu for the CUDA
+  # static libraries that CMake's CUDA language support adds (-lcudadevrt,
+  # -lcudart_static).
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.17)
+    get_filename_component(COMBINE_CUDA_LIB_DIR "${CUDA_CUDART}" DIRECTORY)
+  else()
+    get_filename_component(COMBINE_CUDA_LIB_DIR "${CUDA_CUDART_LIBRARY}" DIRECTORY)
+  endif()
+  if(COMBINE_CUDA_LIB_DIR)
+    # target_link_directories() is not propagated to the CUDA implicit link
+    # step, so pass the search path as an explicit linker option. It must stay
+    # PRIVATE so that it is not added to the link line of the combine
+    # executable, which would pull in the system crt files.
+    target_link_options(${LIBNAME} PRIVATE "-L${COMBINE_CUDA_LIB_DIR}")
+    message(STATUS "CUDA library directory: ${COMBINE_CUDA_LIB_DIR}")
+  endif()
+endif()
 
 
 if(NOT USE_VDT)

@@ -25,6 +25,7 @@ nav:
           - "Unfolding & Regularization": part3/regularisation.md
           - "Validating Datacards":       part3/validation.md
           - "Debugging Fit Failures":     part3/debugging.md
+          - "GPU Acceleration":           part3/gpu.md
         - Tutorials:
           - "RooFit Basics":              part5/roofit.md
           - "Main Features":

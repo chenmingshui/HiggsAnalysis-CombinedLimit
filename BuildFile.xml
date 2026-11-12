@@ -10,6 +10,14 @@
 <use   name="boost_program_options"/>
 <use   name="boost_filesystem"/>
 <flags CXXFLAGS="-DBOOST_BIND_GLOBAL_PLACEHOLDERS -Wno-free-nonheap-object"/>
+<!-- GPU acceleration: the CUDA kernels live in src/gpu_kernels.cu and are only
+     compiled by the standalone CMake build when configured with -DUSE_CUDA=TRUE
+     (which also requires a CUDA toolkit and a CUDA-enabled ROOT build).
+     The CMSSW/SCRAM build always compiles the GPU manager and falls back to
+     the CPU at run time when no CUDA device or CUDA-enabled ROOT is present.
+     To enable the CUDA backend in a CMSSW build, add -DHAS_CUDA to the
+     CXXFLAGS and make the .cu file part of the build with a CUDA-capable
+     SCRAM tool. -->
 <export>
    <lib name="1"/>
 </export>

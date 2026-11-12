@@ -410,6 +410,25 @@ set_property(GLOBAL APPEND PROPERTY ALL_COMBINE_COMMANDS
 # directory where CTest generates the workspace .root files. This is
 # build/test/ for non-standalone builds and build/ for standalone builds.
 
+# ---------------------------------------------------------------------------
+# GPU acceleration
+# ---------------------------------------------------------------------------
+# The GPU backend falls back to the CPU (with a warning) when no CUDA device or
+# CUDA-enabled ROOT is available, so these tests are always safe to run.  They
+# only exercise the real device code when Combine was configured with
+# -DUSE_CUDA=TRUE.
+COMBINE_ADD_TEST(gpu_backend_asymptotic
+    COMMAND bash -c "text2workspace.py ${REPO}/data/tutorials/counting/simple-counting-experiment.txt -o gpu_backend_test.root && combine -M AsymptoticLimits gpu_backend_test.root --gpu"
+    PASSREGEX "Observed Limit|WARNING"
+)
+
+# Check that the GPU specific command line options are advertised.
+COMBINE_ADD_TEST(gpu_options_in_help
+    COMMAND combine --help
+    PASSREGEX "--gpuDevice"
+)
+
+
 get_property(all_combine_commands GLOBAL PROPERTY ALL_COMBINE_COMMANDS)
 message(STATUS "All combine commands:")
 set(_outfile "${CMAKE_CURRENT_BINARY_DIR}/create_reference_files.sh")
